@@ -292,11 +292,12 @@ func (dev Device) callMethodDo(endpoint string, method interface{}) (*http.Respo
 //     back to HTTP digest, which keeps cameras that authenticate exclusively
 //     through WS-Security working.
 //   - DigestAuth ("digest"):      HTTP digest only; no WS-Security header.
-//   - Both ("both") / unset (""): WS-Security credentials are added (when
-//     available) and HTTP digest is attempted only if the device answers with
-//     an authentication challenge (HTTP 401 Unauthorized). On that digest
-//     retry the WS-Security header is dropped so the credentials are not sent
-//     twice.
+//   - Both ("both") / unset (""): the request is first sent with WS-Security
+//     credentials (when available). If the device rejects it with an HTTP
+//     error (e.g. a 400/500 NotAuthorized SOAP fault from a WS-Security-only
+//     camera, or a 401 from a digest-only camera), it is retried through
+//     HTTP digest with the WS-Security header dropped so the credentials are
+//     not sent twice. This mirrors SendSoapWithOptions.
 func (dev Device) sendSOAP(endpoint string, soap gosoap.SoapMessage) (*http.Response, error) {
 	hasCredentials := dev.params.Username != "" || dev.params.Password != ""
 
@@ -314,8 +315,17 @@ func (dev Device) sendSOAP(endpoint string, soap gosoap.SoapMessage) (*http.Resp
 		return networking.SendSoapWithDigest(dev.params.HttpClient, endpoint, soap.String(), dev.params.Username, dev.params.Password)
 
 	default: // Both and the empty/unset default.
-		if hasCredentials {
-			soap.AddWSSecurity(dev.params.Username, dev.params.Password)
+		if !hasCredentials {
+			return networking.SendSoap(dev.params.HttpClient, endpoint, soap.String())
+		}
+		soap.AddWSSecurity(dev.params.Username, dev.params.Password)
+		resp, err := networking.SendSoap(dev.params.HttpClient, endpoint, soap.String())
+		if err == nil {
+			return resp, nil
+		}
+		// Close the rejected response so the connection can be reused.
+		if resp != nil {
+			resp.Body.Close()
 		}
 		return networking.SendSoapWithDigest(dev.params.HttpClient, endpoint, soap.String(), dev.params.Username, dev.params.Password)
 	}
