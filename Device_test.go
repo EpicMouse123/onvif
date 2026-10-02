@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kerberos-io/onvif/gosoap"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -265,4 +267,72 @@ func TestDevice_SendSoapWithOptions_DuplicateWithSOAPHeaderLastWins(t *testing.T
 	require.NoError(t, err)
 	assert.NotContains(t, captured, "First", "first WithSOAPHeader must be overwritten")
 	assert.Contains(t, captured, "Second")
+}
+
+func newBothAuthTestSOAP() gosoap.SoapMessage {
+	soap := gosoap.NewEmptySOAP()
+	soap.AddStringBodyContent(`<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>`)
+	soap.AddRootNamespaces(Xlmns)
+	return soap
+}
+
+// Regression: in "both" mode a WS-Security-only camera answers an
+// unauthenticated request with a NotAuthorized SOAP fault (HTTP 400), not a
+// 401 digest challenge. The first attempt must therefore carry the
+// UsernameToken, otherwise the credentials never reach the camera.
+func TestDevice_SendSOAP_BothSendsWSSecurityFirst(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		b, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(b), "UsernameToken") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`<s:Envelope><s:Body><s:Fault><s:Reason><s:Text>Sender not authorized</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	dev := Device{params: DeviceParams{
+		HttpClient: srv.Client(),
+		Username:   "admin",
+		Password:   "secret",
+		AuthMode:   Both,
+	}}
+	resp, err := dev.sendSOAP(srv.URL, newBothAuthTestSOAP())
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, 1, hits, "WS-Security-only camera should succeed on the first request")
+}
+
+// "both" mode must still fall back to HTTP digest (without the WS-Security
+// header) for cameras that only accept digest.
+func TestDevice_SendSOAP_BothFallsBackToDigest(t *testing.T) {
+	var authedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="onvif", nonce="abc", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		authedBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	dev := Device{params: DeviceParams{
+		HttpClient: srv.Client(),
+		Username:   "admin",
+		Password:   "secret",
+		AuthMode:   Both,
+	}}
+	resp, err := dev.sendSOAP(srv.URL, newBothAuthTestSOAP())
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NotEmpty(t, authedBody, "expected an authenticated digest POST")
+	assert.NotContains(t, authedBody, "UsernameToken")
 }
